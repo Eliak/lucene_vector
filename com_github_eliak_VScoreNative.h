@@ -55,6 +55,14 @@ JNIEXPORT void JNICALL Java_com_github_eliak_VScoreNative_destroyScorer
 JNIEXPORT jfloat JNICALL Java_com_github_eliak_VScoreNative_score
   (JNIEnv *, jclass, jlong, jint, jobject);
 
+/*
+ * Class:     com_github_eliak_VScoreNative
+ * Method:    identity
+ * Signature: (F)F
+ */
+JNIEXPORT jfloat JNICALL Java_com_github_eliak_VScoreNative_identity
+  (JNIEnv *, jclass, jfloat);
+
 #ifdef __cplusplus
 }
 #endif

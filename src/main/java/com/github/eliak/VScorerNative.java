@@ -29,6 +29,7 @@ public class VScorerNative extends VScorer implements VScoreNative.ScorerCallbac
     @Override
     public float score() throws IOException {
         final int docID = docValues.docID() + docBase;
+        // return VScoreNative.identity(0.123f);
         return VScoreNative.score(scorerPtr, docID, this);
     }
 

@@ -18,8 +18,8 @@ public class BenchmarkRunner {
         blackhole.consume(search.scoreDocs);
     }
 
-    @Benchmark
-    @BenchmarkMode(Mode.AverageTime)
+    // @Benchmark
+    // @BenchmarkMode(Mode.AverageTime)
     public void benchCosineSimilarity(BenchSimilarityState state, Blackhole blackhole) throws IOException {
         for (int i = 0; i < 1000000; i++) {
             blackhole.consume(i + cosineSimilarity(state.vector, state.vector, i));

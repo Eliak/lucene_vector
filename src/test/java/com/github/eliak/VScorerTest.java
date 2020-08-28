@@ -73,7 +73,7 @@ public class VScorerTest {
     public void searchNative() throws IOException {
         final IndexReader reader = DirectoryReader.open(writer);
         final IndexSearcher searcher = new IndexSearcher(reader);
-        final VScoreNative.ScorerFactory scorerFactory = new VScoreNative.ScorerFactory();
+        final VScorerNativeFactory scorerFactory = new VScorerNativeFactory();
         for (float[] query_value : Arrays.asList(generateArray(), floats)) {
             final VQuery query = new VQuery(FIELD_NAME, query_value, scorerFactory);
             final TopDocs n = searcher.search(query, 100);

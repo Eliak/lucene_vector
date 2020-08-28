@@ -10,6 +10,8 @@ edition = "2018"
 jni="0.17.0"
 rand = "0.7.3"
 packed_simd = "0.3.3"
+lazy_static = "1.4.0"
+hashers = "1.0.1"
 
 [lib]
 crate_type = ["cdylib"]

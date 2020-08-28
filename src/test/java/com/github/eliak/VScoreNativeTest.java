@@ -16,7 +16,7 @@ public class VScoreNativeTest {
     }
     @Test
     public void naive() {
-        final float[] array = generateArray(true);
+        final float[] array = generateArray(8, true);
         final long scorerFactoryPtr = VScoreNative.createScorerFactory();
         final long scorerPtr = VScoreNative.createScorer(scorerFactoryPtr, array);
         final float similarity1 = VScoreNative.score(scorerPtr, 0, () -> array);

@@ -1,31 +1,49 @@
 #![feature(test)]
+#![feature(type_name_of_val)]
 
-extern crate test;
+
+#[macro_use]
+extern crate lazy_static;
 extern crate packed_simd;
+extern crate test;
 
 use std::collections::HashMap;
-use std::iter::Map;
-use std::mem::transmute;
-use std::rc::Rc;
+use std::hash::BuildHasherDefault;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
 
+use hashers::fnv::{FNV1aHasher32};
 use jni::JNIEnv;
-use jni::objects::{JClass, JObject, JValue};
-use jni::sys::{jbyteArray, jfloatArray, jint, jlong};
-use packed_simd::{f32x4, f32x8, f32x16};
+use jni::objects::{JClass, JObject};
+use jni::sys::{jfloat, jfloatArray, jint, jlong};
+use packed_simd::{f32x16, f32x4, f32x8};
 use rand::Rng;
+use hashers::fx_hash::FxHasher32;
+
+lazy_static! {
+     pub static ref VEC_DUMMY: Arc<Vec<f32>> = {
+        Arc::new(generate_array(512))
+     };
+}
+
+// type Cache = Arc<RwLock<HashMap<i32, Arc<Vec<f32>>, BuildHasherDefault<FNV1aHasher32>>>>;
+// type Cache = Arc<RwLock<HashMap<i32, Arc<Vec<f32>>, BuildHasherDefault<FxHasher32>>>>;
+type Cache = Arc<RwLock<HashMap<i32, Arc<Vec<f32>>>>>;
+fn new_cache() -> Cache {
+    // Arc::new(RwLock::new(HashMap::with_capacity_and_hasher(1000, BuildHasherDefault::<FNV1aHasher32>::default())))
+    // Arc::new(RwLock::new(HashMap::with_capacity_and_hasher(1000, BuildHasherDefault::<FxHasher32>::default())))
+    Arc::new(RwLock::new(HashMap::with_capacity(1000)))
+}
 
 struct ScorerFactory {
-    cache:Arc<RwLock<HashMap<i32, Rc<Vec<f32>>>>>
+    cache: Cache
 }
 impl ScorerFactory {
     pub fn new() -> ScorerFactory {
         ScorerFactory {
-            cache: Arc::new(RwLock::new(HashMap::new()))
+            cache: new_cache()
         }
     }
-    pub fn scorer(mut self:&ScorerFactory, query_vector:Vec<f32>) -> Scorer {
+    pub fn scorer(&self, query_vector:Vec<f32>) -> Scorer {
         Scorer {
             query_vector: Box::new(query_vector),
             cache: self.cache.clone()
@@ -34,32 +52,35 @@ impl ScorerFactory {
 }
 struct Scorer {
     query_vector:Box<Vec<f32>>,
-    cache:Arc<RwLock<HashMap<i32, Rc<Vec<f32>>>>>
+    cache:Cache
 }
 
 impl Scorer {
     pub fn score(&self, env: &JNIEnv, doc_id: i32, callback: JObject) -> f32 {
-        let vector: Rc<Vec<f32>> = self.vector(env, doc_id, callback);
+        let vector: Arc<Vec<f32>> = self.vector(env, doc_id, callback);
         cosine_similarity(self.query_vector.as_ref(), vector.as_ref())
     }
 
-    fn vector(&self, env: &JNIEnv, doc_id: i32, callback: JObject) -> Rc<Vec<f32>> {
+    fn vector(&self, env: &JNIEnv, doc_id: i32, callback: JObject) -> Arc<Vec<f32>> {
+        // return VEC_DUMMY.clone();
         let cache = self.cache.clone();
         {
             let guard = cache.read().unwrap();
-            let option = guard.get(&doc_id);
-            if option.is_some() {
-                return option.unwrap().clone();
+            if let Some(v) = guard.get(&doc_id) {
+                return v.clone();
             }
         }
         let result = env.call_method(callback, "binaryValue", "()[F", &[]);
-        if(result.is_err()) {
+        if result.is_err() {
             panic!("receive binaryValue error: {}", result.err().unwrap());
         }
         let b_array = result.unwrap().l().unwrap().into_inner() as jfloatArray;
-        let vec: Vec<f32> = convert_to_vec(env, b_array);
-        cache.write().unwrap().insert(doc_id.clone(), Rc::new(vec));
-        return cache.read().unwrap().get(&doc_id).unwrap().clone();
+        let vec: Arc<Vec<f32>> = Arc::new(convert_to_vec(env, b_array));
+        {
+            let mut guard = cache.write().unwrap();
+            guard.insert(doc_id.clone(), vec.clone());
+        }
+        return vec;
     }
 }
 
@@ -70,11 +91,11 @@ impl Scorer {
  */
 #[no_mangle]
 pub extern "system" fn Java_com_github_eliak_VScoreNative_cosineSimilarity(
-    env: JNIEnv, _class: JClass,
+    _env: JNIEnv, _class: JClass,
     one: jfloatArray, another: jfloatArray
 ) -> f32 {
-    let vec1 = convert_to_vec(&env, one);
-    let vec2 = convert_to_vec(&env, another);
+    let vec1 = convert_to_vec(&_env, one);
+    let vec2 = convert_to_vec(&_env, another);
     let similarity = cosine_similarity(&vec1, &vec2);
     drop(vec1);
     drop(vec2);
@@ -87,7 +108,7 @@ pub extern "system" fn Java_com_github_eliak_VScoreNative_cosineSimilarity(
  * Signature: ()J
  */
 #[no_mangle]
-pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_createScorerFactory(env: JNIEnv, _class: JClass) -> i64 {
+pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_createScorerFactory(_env: JNIEnv, _class: JClass) -> i64 {
     let factory = ScorerFactory::new();
     let result = Box::into_raw(Box::new(factory)) as jlong;
     // println!("createScorerFactory: {}", result);
@@ -101,7 +122,7 @@ pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_createScorerFac
  */
 #[no_mangle]
 pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_destroyScorerFactory(
-    env: JNIEnv, _class: JClass,
+    _env: JNIEnv, _class: JClass,
     factory_ptr: jlong
 ) {
     // println!("destroyScorerFactory: {}", factory_ptr);
@@ -116,11 +137,11 @@ pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_destroyScorerFa
  */
 #[no_mangle]
 pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_createScorer(
-    env: JNIEnv, _class: JClass,
+    _env: JNIEnv, _class: JClass,
     factory_ptr: jlong, query_vector: jfloatArray
 ) -> jlong {
     let factory = &*(factory_ptr as *const ScorerFactory);
-    let scorer = factory.scorer(convert_to_vec(&env, query_vector));
+    let scorer = factory.scorer(convert_to_vec(&_env, query_vector));
     let result = Box::into_raw(Box::new(scorer)) as jlong;
     // println!("createScorer: {} from factory {}, cache.len={}", result, factory_ptr, factory.cache.clone().read().unwrap().len());
     result
@@ -133,7 +154,7 @@ pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_createScorer(
  */
 #[no_mangle]
 pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_destroyScorer(
-    env: JNIEnv, _class: JClass,
+    _env: JNIEnv, _class: JClass,
     scorer_ptr: jlong
 ) {
     // println!("destroyScorer: {}", scorer_ptr);
@@ -148,13 +169,24 @@ pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_destroyScorer(
  */
 #[no_mangle]
 pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_score(
-    env: JNIEnv, _class: JClass,
+    _env: JNIEnv, _class: JClass,
     scorer_ptr: jlong, doc_id: jint, callback: JObject
 ) -> f32 {
     let scorer = &*(scorer_ptr as *const Scorer);
-    scorer.score(&env, doc_id, callback)
+    scorer.score(&_env, doc_id, callback)
 }
 
+/*
+ * Class:     com_github_eliak_VScoreNative
+ * Method:    identity
+ * Signature: (F)F
+ */
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_identity(
+    _env: JNIEnv, _class: JClass, num:jfloat
+) -> f32 {
+    num.clone()
+}
 
 
 fn convert_to_vec(env: &JNIEnv, array: jfloatArray) -> Vec<f32> {
@@ -230,9 +262,14 @@ fn generate_array(size:usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
-
-    use crate::{cosine_similarity, generate_array};
     use test::Bencher;
+
+    use crate::{cosine_similarity, generate_array, ScorerFactory};
+    use std::sync::Arc;
+    use std::any::{Any, type_name_of_val};
+    use std::hash::BuildHasherDefault;
+    use hashers::fx_hash::FxHasher32;
+    use std::collections::HashMap;
 
     #[test]
     fn test_cosine_similarity() {
@@ -271,5 +308,57 @@ mod tests {
                 similarity += cosine_similarity(&vec, &vec);
             }
         });
+    }
+
+    #[bench]
+    fn bench_scorer_factory_cache(b:&mut Bencher) {
+        let factory = ScorerFactory::new();
+        {
+            let mut guard = factory.cache.write().unwrap();
+            for i in 0..100 {
+                guard.insert(i.clone(), Arc::new(vec![i as f32]));
+            }
+        }
+
+        b.iter(|| {
+            let size = test::black_box(100000);
+            for i in 0..size {
+                let guard = factory.cache.read().unwrap();
+                if let Some(v) = guard.get(&(i % 100)) {
+                    test::black_box(v.clone());
+                }
+            }
+        });
+    }
+
+    #[bench]
+    fn bench_scorer_factory_map(b:&mut Bencher) {
+        let mut map = HashMap::with_capacity_and_hasher(1000, BuildHasherDefault::<FxHasher32>::default());
+        {
+            for i in 0..100 {
+                map.insert(i.clone(), Arc::new(vec![i as f32]));
+            }
+        }
+
+        b.iter(|| {
+            let size = test::black_box(100000);
+            for i in 0..size {
+                if let Some(v) = map.get(&(i % 100)) {
+                    test::black_box(v.clone());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_scorer_factory_cache() {
+        let factory = ScorerFactory::new();
+        {
+            let mut guard = factory.cache.write().unwrap();
+            println!("type_name_of_val(&guard.hasher()) = {}", type_name_of_val(&guard.hasher()));
+            for i in 0..100 {
+                guard.insert(i.clone(), Arc::new(vec![i as f32]));
+            }
+        }
     }
 }

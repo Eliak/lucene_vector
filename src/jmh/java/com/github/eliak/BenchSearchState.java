@@ -23,9 +23,9 @@ public class BenchSearchState {
     public IndexWriter writer;
     public IndexReader reader;
     public IndexSearcher searcher;
-    private VScoreNative.ScorerFactory scorerFactory;
+    private VScorerNativeFactory scorerFactory;
 
-    @Param({"native", "simpleCache", "default"})
+    @Param({"native"/*, "simpleCache", "default"*/})
     public String scoreFunction;
 
     public VQuery query;
@@ -55,7 +55,7 @@ public class BenchSearchState {
                 break;
             }
             case "native": {
-                scorerFactory = new VScoreNative.ScorerFactory();
+                scorerFactory = new VScorerNativeFactory();
                 break;
             }
             default:
