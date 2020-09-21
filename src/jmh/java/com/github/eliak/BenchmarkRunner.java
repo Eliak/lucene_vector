@@ -22,8 +22,16 @@ public class BenchmarkRunner {
     // @BenchmarkMode(Mode.AverageTime)
     public void benchCosineSimilarity(BenchSimilarityState state, Blackhole blackhole) throws IOException {
         for (int i = 0; i < 1000000; i++) {
-            blackhole.consume(i + cosineSimilarity(state.vector, state.vector, i));
+            blackhole.consume(i + cosineSimilarity(state.vector_1, state.vector_2, i));
         }
+    }
+
+    // @Benchmark
+    // @BenchmarkMode(Mode.AverageTime)
+    public void benchCosineSimilarity2(BenchSimilarityState state, Blackhole blackhole) throws IOException {
+        final float similarity = VScoreNative.cosineSimilarity2(state.vector_1, state.vector_2);
+        System.out.println("------------------" + similarity);
+        blackhole.consume(similarity);
     }
 
     public static float cosineSimilarity(float[] one, float[] another, int c) {

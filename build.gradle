@@ -15,12 +15,22 @@ dependencies {
     testCompile group: 'org.testng', name: 'testng', version: '7.3.0'
 
     implementation group: 'org.apache.lucene', name: 'lucene-core', version: '8.6.1'
+
+    implementation group: 'com.fasterxml.jackson.core', name: 'jackson-databind', version: '2.11.2'
+
+
+
     jmh group: 'org.openjdk.jmh', name: 'jmh-core', version: '1.25'
     jmh group: 'org.openjdk.jmh', name: 'jmh-generator-annprocess', version: '1.25'
 
 }
 
 jmh {
+    warmup = '5s'
     warmupIterations = 1
-    fork = 3
+    iterations = 2
+    timeOnIteration = '10s'
+    fork = 2
+    threads = 1
+    jvmArgsAppend = [/*'-Xcomp', -XX:+CriticalJNINatives*/]
 }

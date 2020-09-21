@@ -9,9 +9,14 @@ import java.io.IOException;
 
 @State(Scope.Benchmark)
 public class BenchSimilarityState {
-    public float[] vector;
+    public float[] vector_1;
+    public float[] vector_2;
     @Setup(Level.Trial)
     public void setUp() throws IOException {
-        vector = BenchUtils.generateArray(true);
+        vector_1 = BenchUtils.generateArray(true);
+        vector_2 = BenchUtils.generateArray(true);
+        System.out.println(">>>>>>>>>>>>>>>>>>");
+        System.out.println("------------------" + VScoreNative.cosineSimilarity2(vector_1, vector_2));
+        System.out.println("<<<<<<<<<<<<<<<<<<<");
     }
 }

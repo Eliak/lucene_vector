@@ -25,7 +25,7 @@ public class BenchSearchState {
     public IndexSearcher searcher;
     private VScorerNativeFactory scorerFactory;
 
-    @Param({"native"/*, "simpleCache", "default"*/})
+    @Param({"native", "nativeCritical", "simpleCache", "default"})
     public String scoreFunction;
 
     public VQuery query;
@@ -52,6 +52,11 @@ public class BenchSearchState {
             case "simpleCache": {
                 final Map<Integer, float[]> cache = new HashMap<>(10);
                 scorerFactory = (w, dv, dbase) -> new VScorerSimpleCache(w, dv, dbase, cache);
+                break;
+            }
+            case "nativeCritical": {
+                final Map<Integer, float[]> cache = new HashMap<>(10);
+                scorerFactory = (w, dv, dbase) -> new VScorerNativeCritical(w, dv, dbase, cache);
                 break;
             }
             case "native": {
