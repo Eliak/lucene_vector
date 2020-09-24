@@ -8,79 +8,22 @@ extern crate test;
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock};
 
 use hashers::fnv::FNV1aHasher32;
 use hashers::fx_hash::FxHasher32;
 use jni::objects::{JClass, JObject, ReleaseMode};
-use jni::sys::{jfloat, jfloatArray, jint, jlong};
+use jni::sys::{jbyte, jbyteArray, jfloat, jfloatArray, jint, jlong, jsize};
 use jni::JNIEnv;
 use packed_simd::{f32x16, f32x4, f32x8};
 use rand::Rng;
 
-lazy_static! {
-    pub static ref VEC_DUMMY: Arc<Vec<f32>> = Arc::new(generate_array(512));
-}
+mod aligned;
+mod unaligned;
 
-// type Cache = Arc<RwLock<HashMap<i32, Arc<Vec<f32>>, BuildHasherDefault<FNV1aHasher32>>>>;
-// type Cache = Arc<RwLock<HashMap<i32, Arc<Vec<f32>>, BuildHasherDefault<FxHasher32>>>>;
-type Cache = Arc<RwLock<HashMap<i32, Arc<Vec<f32>>>>>;
-
-fn new_cache() -> Cache {
-    // Arc::new(RwLock::new(HashMap::with_capacity_and_hasher(1000, BuildHasherDefault::<FNV1aHasher32>::default())))
-    // Arc::new(RwLock::new(HashMap::with_capacity_and_hasher(1000, BuildHasherDefault::<FxHasher32>::default())))
-    Arc::new(RwLock::new(HashMap::with_capacity(1000)))
-}
-
-struct ScorerFactory {
-    cache: Cache,
-}
-
-impl ScorerFactory {
-    pub fn new() -> ScorerFactory {
-        ScorerFactory { cache: new_cache() }
-    }
-    pub fn scorer(&self, query_vector: Vec<f32>) -> Scorer {
-        Scorer {
-            query_vector: Box::new(query_vector),
-            cache: self.cache.clone(),
-        }
-    }
-}
-
-struct Scorer {
-    query_vector: Box<Vec<f32>>,
-    cache: Cache,
-}
-
-impl Scorer {
-    pub fn score(&self, env: &JNIEnv, doc_id: i32, callback: JObject) -> f32 {
-        let vector: Arc<Vec<f32>> = self.vector(env, doc_id, callback);
-        cosine_similarity(self.query_vector.as_ref(), vector.as_ref())
-    }
-
-    fn vector(&self, env: &JNIEnv, doc_id: i32, callback: JObject) -> Arc<Vec<f32>> {
-        // return VEC_DUMMY.clone();
-        let cache = self.cache.clone();
-        {
-            let guard = cache.read().unwrap();
-            if let Some(v) = guard.get(&doc_id) {
-                return v.clone();
-            }
-        }
-        let result = env.call_method(callback, "binaryValue", "()[F", &[]);
-        if result.is_err() {
-            panic!("receive binaryValue error: {}", result.err().unwrap());
-        }
-        let b_array = result.unwrap().l().unwrap().into_inner() as jfloatArray;
-        let vec: Arc<Vec<f32>> = Arc::new(convert_to_vec(env, b_array));
-        {
-            let mut guard = cache.write().unwrap();
-            guard.insert(doc_id.clone(), vec.clone());
-        }
-        return vec;
-    }
-}
+#[cfg(test)]
+mod tests;
 
 /*
  * Class:     com_github_eliak_VScoreNative
@@ -94,11 +37,11 @@ pub extern "system" fn Java_com_github_eliak_VScoreNative_cosineSimilarity(
     one: jfloatArray,
     another: jfloatArray,
 ) -> f32 {
-    let vec1 = convert_to_vec(&_env, one);
-    let vec2 = convert_to_vec(&_env, another);
-    let similarity = cosine_similarity(&vec1, &vec2);
-    drop(vec1);
-    drop(vec2);
+    let item1 = aligned::Item::from_jni_float_array(&_env, one);
+    let item2 = aligned::Item::from_jni_float_array(&_env, another);
+    let similarity = item1.cosine_similarity(&item2);
+    drop(item1);
+    drop(item2);
     return similarity;
 }
 
@@ -135,9 +78,11 @@ pub extern "system" fn JavaCritical_com_github_eliak_VScoreNative_cosineSimilari
     two_ptr: &jfloat,
 ) -> f32 {
     println!("JavaCritical_");
-    let one_slice = unsafe { std::slice::from_raw_parts(one_ptr as *const _ as *const f32, one_len as usize) };
-    let two_slice = unsafe { std::slice::from_raw_parts(two_ptr as *const _ as *const f32, two_len as usize) };
-    let similarity = cosine_similarity(one_slice, two_slice);
+    let one_slice =
+        unsafe { std::slice::from_raw_parts(one_ptr as *const _ as *const f32, one_len as usize) };
+    let two_slice =
+        unsafe { std::slice::from_raw_parts(two_ptr as *const _ as *const f32, two_len as usize) };
+    let similarity = unaligned::cosine_similarity(one_slice, two_slice);
     std::mem::forget(one_slice);
     std::mem::forget(two_slice);
     return similarity;
@@ -173,7 +118,7 @@ pub extern "system" fn Java_com_github_eliak_VScoreNative_cosineSimilarityCritic
     let two_ptr = two_auto.as_ptr() as *mut f32;
     let two_slice = unsafe { std::slice::from_raw_parts(two_ptr, len) };
 
-    let similarity = cosine_similarity(one_slice, two_slice);
+    let similarity = unaligned::cosine_similarity(one_slice, two_slice);
 
     std::mem::forget(one_slice);
     std::mem::forget(two_slice);
@@ -216,7 +161,7 @@ pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_createScorerFac
     _env: JNIEnv,
     _class: JClass,
 ) -> i64 {
-    let factory = ScorerFactory::new();
+    let factory = aligned::ScorerFactory::new();
     let result = Box::into_raw(Box::new(factory)) as jlong;
     // println!("createScorerFactory: {}", result);
     result
@@ -228,13 +173,13 @@ pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_createScorerFac
  * Signature: (J)J
  */
 #[no_mangle]
-pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_destroyScorerFactory(
+pub extern "system" fn Java_com_github_eliak_VScoreNative_destroyScorerFactory(
     _env: JNIEnv,
     _class: JClass,
     factory_ptr: jlong,
 ) {
     // println!("destroyScorerFactory: {}", factory_ptr);
-    let _boxed_factory = Box::from_raw(factory_ptr as *mut ScorerFactory);
+    let _boxed_factory = unsafe { Box::from_raw(factory_ptr as *mut aligned::ScorerFactory) };
     drop(_boxed_factory);
 }
 
@@ -250,8 +195,8 @@ pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_createScorer(
     factory_ptr: jlong,
     query_vector: jfloatArray,
 ) -> jlong {
-    let factory = &*(factory_ptr as *const ScorerFactory);
-    let scorer = factory.scorer(convert_to_vec(&_env, query_vector));
+    let factory = &*(factory_ptr as *const aligned::ScorerFactory);
+    let scorer = factory.scorer(aligned::Item::from_jni_float_array(&_env, query_vector));
     let result = Box::into_raw(Box::new(scorer)) as jlong;
     // println!("createScorer: {} from factory {}, cache.len={}", result, factory_ptr, factory.cache.clone().read().unwrap().len());
     result
@@ -269,7 +214,7 @@ pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_destroyScorer(
     scorer_ptr: jlong,
 ) {
     // println!("destroyScorer: {}", scorer_ptr);
-    let _boxed_scorer = Box::from_raw(scorer_ptr as *mut Scorer);
+    let _boxed_scorer = Box::from_raw(scorer_ptr as *mut aligned::Scorer);
     drop(_boxed_scorer);
 }
 
@@ -286,8 +231,8 @@ pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_score(
     doc_id: jint,
     callback: JObject,
 ) -> f32 {
-    let scorer = &*(scorer_ptr as *const Scorer);
-    scorer.score(&_env, doc_id, callback)
+    let scorer = &*(scorer_ptr as *const aligned::Scorer);
+    scorer.score(&_env, doc_id as aligned::DocId, callback)
 }
 
 /*
@@ -304,190 +249,356 @@ pub unsafe extern "system" fn Java_com_github_eliak_VScoreNative_identity(
     num.clone()
 }
 
-fn convert_to_vec(env: &JNIEnv, array: jfloatArray) -> Vec<f32> {
-    let len = env.get_array_length(array).unwrap();
-    let mut vec = vec![0f32; len as usize];
-    env.get_float_array_region(array, 0, vec.as_mut()).unwrap();
-    return vec;
+/****************************************************************************************************
+package com.iqmen.iqfacescore;
+public class NativeScorerFactory {
+    public static native long createScorerFactory();
+    public static native long destroyScorerFactory(long factoryPtr);
+    public static native long createScorer(long factoryPtr, float[] vector);
+    public static native void destroyScorer(long scorerPtr);
+    public static native float dotProduct(long scorerPtr, long docID, ScorerCallback callback);
+    public static native float cosineSimilarity(long scorerPtr, long docID, ScorerCallback callback);
+    public static native long createItem(float[] vector);
+    public static native void destroyItem(long ptr);
+    public static native float itemDotProduct(long itemPtr1, long itemPtr2);
+    public static native float itemDotProductWithVector(long itemPtr, float[] vector);
+    public static native float itemCosineSimilarity(long itemPtr1, long itemPtr2);
+    public static native float dotProductVectorAndSerializedVector(float[] vector1, byte[] vector2);
+}
+****************************************************************************************************/
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    createScorerFactory
+ * Signature: ()J
+ */
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_iqmen_iqfacescore_NativeScorerFactory_createScorerFactory(
+    _env: JNIEnv,
+    _class: JClass,
+) -> i64 {
+    let factory = aligned::ScorerFactory::new();
+    let result = Box::into_raw(Box::new(factory)) as jlong;
+    //println!("create scorer factory: {:?}", result);
+    result
 }
 
-fn cosine_similarity(one: &[f32], another: &[f32]) -> f32 {
-    assert_eq!(one.len(), another.len());
-    let size = one.len() - 1;
-    let dot_product: f32 = dot_prod16(&one[..size], &another[..size]);
-    return dot_product / (one[size] * another[size]);
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    destroyScorerFactory
+ * Signature: (J)J
+ */
+#[no_mangle]
+pub extern "system" fn Java_com_iqmen_iqfacescore_NativeScorerFactory_destroyScorerFactory(
+    _env: JNIEnv,
+    _class: JClass,
+    factory_ptr: jlong,
+) {
+    println!("drop scorer factory: {:?}", factory_ptr);
+    let _boxed_factory = unsafe { Box::from_raw(factory_ptr as *mut aligned::ScorerFactory) };
+    drop(_boxed_factory);
 }
 
-pub fn dot_prod1(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot_product: f32 = 0f32;
-    for i in 0..a.len() {
-        dot_product += a[i] * b[i];
-    }
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    createScorer
+ * Signature: (J[F)J
+ */
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_iqmen_iqfacescore_NativeScorerFactory_createScorer(
+    _env: JNIEnv,
+    _class: JClass,
+    factory_ptr: jlong,
+    query_vector: jfloatArray,
+) -> jlong {
+    let factory = &*(factory_ptr as *const aligned::ScorerFactory);
+    let scorer = factory.scorer(aligned::Item::from_jni_float_array(&_env, query_vector));
+    let result = Box::into_raw(Box::new(scorer)) as jlong;
+    //println!("create scorer {:?} by factory: {:?}", result, factory_ptr);
+    result
+}
+
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    destroyScorer
+ * Signature: (J)V
+ */
+#[no_mangle]
+pub extern "system" fn Java_com_iqmen_iqfacescore_NativeScorerFactory_destroyScorer(
+    _env: JNIEnv,
+    _class: JClass,
+    scorer_ptr: jlong,
+) {
+    //println!("drop scorer: {:?}", scorer_ptr);
+    let _boxed_scorer = unsafe { Box::from_raw(scorer_ptr as *mut aligned::Scorer) };
+    drop(_boxed_scorer);
+}
+
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    dotProduct
+ * Signature: (JILcom/github/eliak/VScoreNative/ScorerCallback;)F
+ */
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_iqmen_iqfacescore_NativeScorerFactory_dotProduct(
+    _env: JNIEnv,
+    _class: JClass,
+    scorer_ptr: jlong,
+    doc_id: jlong,
+    callback: JObject,
+) -> f32 {
+    let scorer = &*(scorer_ptr as *const aligned::Scorer);
+    scorer.dot_product(&_env, doc_id as aligned::DocId, callback)
+}
+
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    cosineSimilarity
+ * Signature: (JILcom/github/eliak/VScoreNative/ScorerCallback;)F
+ */
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_iqmen_iqfacescore_NativeScorerFactory_cosineSimilarity(
+    _env: JNIEnv,
+    _class: JClass,
+    scorer_ptr: jlong,
+    doc_id: jlong,
+    callback: JObject,
+) -> f32 {
+    let scorer = &*(scorer_ptr as *const aligned::Scorer);
+    scorer.cosine_similarity(&_env, doc_id as aligned::DocId, callback)
+}
+
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    createItem
+ * Signature: ([F)J
+ */
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_iqmen_iqfacescore_NativeScorerFactory_createItem(
+    _env: JNIEnv,
+    _class: JClass,
+    query_vector: jfloatArray,
+) -> jlong {
+    let boxed_item = Box::new(aligned::Item::from_jni_float_array(&_env, query_vector));
+    let result = Box::into_raw(boxed_item) as jlong;
+    //println!("create item {:?} by factory: {:?}", result, factory_ptr);
+    result
+}
+
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    destroyItem
+ * Signature: (J)V
+ */
+#[no_mangle]
+pub extern "system" fn Java_com_iqmen_iqfacescore_NativeScorerFactory_destroyItem(
+    _env: JNIEnv,
+    _class: JClass,
+    item_ptr: jlong,
+) {
+    //println!("drop scorer: {:?}", scorer_ptr);
+    let _boxed_item = unsafe { Box::from_raw(item_ptr as *mut aligned::Item) };
+    drop(_boxed_item);
+}
+
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    itemDotProduct
+ * Signature: (JJ)F
+ */
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_iqmen_iqfacescore_NativeScorerFactory_itemDotProduct(
+    _env: JNIEnv,
+    _class: JClass,
+    item_ptr_1: jlong,
+    item_ptr_2: jlong,
+) -> f32 {
+    let item_1 = &*(item_ptr_1 as *const aligned::Item);
+    let item_2 = &*(item_ptr_2 as *const aligned::Item);
+    item_1.dot_product(item_2)
+}
+
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    itemDotProductWithVector
+ * Signature: (J[F)F
+ */
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_iqmen_iqfacescore_NativeScorerFactory_itemDotProductWithVector(
+    _env: JNIEnv,
+    _class: JClass,
+    item_ptr: jlong,
+    vector: jfloatArray,
+) -> f32 {
+    let item = &*(item_ptr as *const aligned::Item);
+    let len = _env.get_array_length(vector).unwrap() as usize;
+    let vector_auto = _env
+        .get_auto_primitive_array_critical(vector, ReleaseMode::NoCopyBack)
+        .unwrap();
+    let vector_ptr = vector_auto.as_ptr() as *mut f32;
+    let vector_slice = unsafe { std::slice::from_raw_parts(vector_ptr, len) };
+    let similarity = item.dot_product_with_unaligned(vector_slice);
+    std::mem::forget(vector_slice);
+    return similarity;
+}
+
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    itemDotProductWithVector
+ * Signature: (JI[F)F
+ */
+#[no_mangle]
+pub unsafe extern "system" fn JavaCritical_com_iqmen_iqfacescore_NativeScorerFactory_itemDotProductWithVector(
+    item_ptr: jlong,
+    vector_len: jint,
+    vector_ptr: &jfloat,
+) -> f32 {
+    let item = &*(item_ptr as *const aligned::Item);
+    let slice = unsafe {
+        std::slice::from_raw_parts(vector_ptr as *const _ as *const f32, vector_len as usize)
+    };
+    let dot_product = item.dot_product_with_unaligned(slice);
+    std::mem::forget(slice);
     return dot_product;
 }
 
-pub fn dot_prod4(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len());
-    assert_eq!(a.len() % 4, 0);
-
-    a.chunks_exact(4)
-        .map(f32x4::from_slice_unaligned)
-        .zip(b.chunks_exact(4).map(f32x4::from_slice_unaligned))
-        .map(|(a, b)| a * b)
-        .sum::<f32x4>()
-        .sum()
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    itemCosineSimilarity
+ * Signature: (JJ)F
+ */
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_iqmen_iqfacescore_NativeScorerFactory_itemCosineSimilarity(
+    _env: JNIEnv,
+    _class: JClass,
+    item_ptr_1: jlong,
+    item_ptr_2: jlong,
+) -> f32 {
+    let item_1 = &*(item_ptr_1 as *const aligned::Item);
+    let item_2 = &*(item_ptr_2 as *const aligned::Item);
+    item_1.cosine_similarity(item_2)
 }
 
-pub fn dot_prod8(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len());
-    assert!(a.len() % 8 == 0);
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    dotProductVectors
+ * Signature: ([F[F)F
+ */
+#[no_mangle]
+pub extern "system" fn Java_com_iqmen_iqfacescore_NativeScorerFactory_dotProductVectors(
+    _env: JNIEnv,
+    _class: JClass,
+    one: jfloatArray,
+    two: jfloatArray,
+) -> f32 {
+    let one_len = _env.get_array_length(one).unwrap();
+    let two_len = _env.get_array_length(two).unwrap();
 
-    a.chunks_exact(8)
-        .map(f32x8::from_slice_unaligned)
-        .zip(b.chunks_exact(8).map(f32x8::from_slice_unaligned))
-        .map(|(a, b)| a * b)
-        .sum::<f32x8>()
-        .sum()
+    assert_eq!(one_len, two_len);
+
+    let one_auto = _env
+        .get_auto_primitive_array_critical(one, ReleaseMode::NoCopyBack)
+        .unwrap();
+    let one_ptr = one_auto.as_ptr() as *mut f32;
+    let one_slice = unsafe { std::slice::from_raw_parts(one_ptr, one_len as usize) };
+
+    let two_auto = _env
+        .get_auto_primitive_array_critical(two, ReleaseMode::NoCopyBack)
+        .unwrap();
+    let two_ptr = two_auto.as_ptr() as *mut f32;
+    let two_slice = unsafe { std::slice::from_raw_parts(two_ptr, two_len as usize) };
+
+    let similarity = unaligned::dot_prod(one_slice, two_slice);
+
+    std::mem::forget(one_slice);
+    std::mem::forget(two_slice);
+
+    return similarity;
 }
 
-pub fn dot_prod16(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len());
-    assert!(a.len() % 16 == 0);
-
-    a.chunks_exact(16)
-        .map(f32x16::from_slice_unaligned)
-        .zip(b.chunks_exact(16).map(f32x16::from_slice_unaligned))
-        .map(|(a, b)| a * b)
-        .sum::<f32x16>()
-        .sum()
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    dotProductVectors
+ * Signature: (I[FI[F)F
+ * для работы этой функции JVM должна быть запущена с опцией: -Xcomp
+ */
+#[no_mangle]
+pub extern "system" fn JavaCritical_com_iqmen_iqfacescore_NativeScorerFactory_dotProductVectors(
+    one_len: jint,
+    one_ptr: &jfloat,
+    two_len: jint,
+    two_ptr: &jfloat,
+) -> f32 {
+    let one_slice =
+        unsafe { std::slice::from_raw_parts(one_ptr as *const _ as *const f32, one_len as usize) };
+    let two_slice =
+        unsafe { std::slice::from_raw_parts(two_ptr as *const _ as *const f32, two_len as usize) };
+    let similarity = unaligned::dot_prod(one_slice, two_slice);
+    std::mem::forget(one_slice);
+    std::mem::forget(two_slice);
+    return similarity;
 }
 
-fn generate_array(size: usize) -> Vec<f32> {
-    let mut vec = Vec::new();
-    let mut rng = rand::thread_rng();
-    let mut dot_product: f64 = 0 as f64;
-    for _ in 0..size {
-        let val = rng.gen::<f32>();
-        dot_product += (val as f64).powi(2);
-        vec.push(val);
-    }
-    vec.push(dot_product.sqrt() as f32);
-    return vec;
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    dotProductVectorAndSerializedVector
+ * Signature: ([F[B)F
+ */
+#[no_mangle]
+pub extern "system" fn Java_com_iqmen_iqfacescore_NativeScorerFactory_dotProductVectorAndSerializedVector(
+    _env: JNIEnv,
+    _class: JClass,
+    one: jfloatArray,
+    two: jbyteArray,
+) -> f32 {
+    let one_len = _env.get_array_length(one).unwrap();
+    let two_len = _env.get_array_length(two).unwrap();
+
+    assert_eq!(two_len % 4, 0);
+    assert_eq!(one_len, two_len / 4);
+
+    let one_auto = _env
+        .get_auto_primitive_array_critical(one, ReleaseMode::NoCopyBack)
+        .unwrap();
+    let one_ptr = one_auto.as_ptr() as *mut f32;
+    let one_slice = unsafe { std::slice::from_raw_parts(one_ptr, one_len as usize) };
+
+    let two_auto = _env
+        .get_auto_primitive_array_critical(two, ReleaseMode::NoCopyBack)
+        .unwrap();
+    let two_ptr = two_auto.as_ptr() as *mut f32;
+    let two_slice = unsafe { std::slice::from_raw_parts(two_ptr, (two_len / 4) as usize) };
+
+    let similarity = unaligned::dot_prod(one_slice, two_slice);
+
+    std::mem::forget(one_slice);
+    std::mem::forget(two_slice);
+
+    return similarity;
 }
 
-#[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
-    use test::Bencher;
+/*
+ * Class:     com_iqmen_iqfacescore_NativeScorerFactory
+ * Method:    dotProductVectorAndSerializedVector
+ * Signature: (I[FI[B)F
+ * для работы этой функции JVM должна быть запущена с опцией: -Xcomp
+ */
+#[no_mangle]
+pub extern "system" fn JavaCritical_com_iqmen_iqfacescore_NativeScorerFactory_dotProductVectorAndSerializedVector(
+    one_len: jint,
+    one_ptr: &jfloat,
+    two_len: jint,
+    two_ptr: &jbyte,
+) -> f32 {
+    assert_eq!(two_len % 4, 0);
+    assert_eq!(one_len, two_len / 4);
 
-    use crate::{cosine_similarity, generate_array, ScorerFactory};
-    use hashers::fx_hash::FxHasher32;
-    use std::any::type_name_of_val;
-    use std::collections::HashMap;
-    use std::hash::BuildHasherDefault;
-    use std::sync::Arc;
-
-    #[test]
-    fn test_cosine_similarity() {
-        let vec = generate_array(64);
-        assert_eq!((cosine_similarity(&vec, &vec) * 10000f32).round(), 10000f32);
-    }
-
-    /**
-     * Настоящий бенчмарк выдаёт малопонятный результат типа
-     *   test tests::bench_cosine_similarity2 ... bench:  65,161,520 ns/iter (+/- 5,057,415)
-     *   test result: ok. 0 passed; 0 failed; 0 ignored; 1 measured; 2 filtered out
-     * по этому написал такое:
-     */
-    #[test]
-    fn bench_cosine_similarity() {
-        let len = 10000;
-        let mut vec = Vec::with_capacity(len);
-        for _ in 0..len {
-            vec.push(generate_array(512));
-        }
-        let start = Instant::now();
-        let mut similarity: f32 = 0f32;
-        let size = 1000000;
-        for i in 0..size {
-            similarity += cosine_similarity(&vec[i % len], &vec[len - 1 - (i % len)]);
-        }
-        let duration = Instant::now().checked_duration_since(start).unwrap();
-        println!("{}", similarity);
-        let d = duration.as_secs_f64();
-        println!("duration {}, {} op/s", d, size as f64 / d);
-    }
-
-    #[bench]
-    fn bench_cosine_similarity2(b: &mut Bencher) {
-        let len = 10000;
-        let mut vec = Vec::with_capacity(len);
-        for _ in 0..len {
-            vec.push(generate_array(512));
-        }
-        b.iter(|| {
-            let size = test::black_box(1000000);
-            let mut similarity: f32 = 0f32;
-            for i in 0..size {
-                similarity += cosine_similarity(&vec[i % len], &vec[len - 1 - (i % len)]);
-            }
-            test::black_box(similarity);
-        });
-    }
-
-    #[bench]
-    fn bench_scorer_factory_cache(b: &mut Bencher) {
-        let factory = ScorerFactory::new();
-        {
-            let mut guard = factory.cache.write().unwrap();
-            for i in 0..100 {
-                guard.insert(i.clone(), Arc::new(vec![i as f32]));
-            }
-        }
-
-        b.iter(|| {
-            let size = test::black_box(100000);
-            for i in 0..size {
-                let guard = factory.cache.read().unwrap();
-                if let Some(v) = guard.get(&(i % 100)) {
-                    test::black_box(v.clone());
-                }
-            }
-        });
-    }
-
-    #[bench]
-    fn bench_scorer_factory_map(b: &mut Bencher) {
-        let mut map =
-            HashMap::with_capacity_and_hasher(1000, BuildHasherDefault::<FxHasher32>::default());
-        {
-            for i in 0..100 {
-                map.insert(i.clone(), Arc::new(vec![i as f32]));
-            }
-        }
-
-        b.iter(|| {
-            let size = test::black_box(100000);
-            for i in 0..size {
-                if let Some(v) = map.get(&(i % 100)) {
-                    test::black_box(v.clone());
-                }
-            }
-        });
-    }
-
-    #[test]
-    fn test_scorer_factory_cache() {
-        let factory = ScorerFactory::new();
-        {
-            let mut guard = factory.cache.write().unwrap();
-            println!(
-                "type_name_of_val(&guard.hasher()) = {}",
-                type_name_of_val(&guard.hasher())
-            );
-            for i in 0..100 {
-                guard.insert(i.clone(), Arc::new(vec![i as f32]));
-            }
-        }
-    }
+    let one_slice =
+        unsafe { std::slice::from_raw_parts(one_ptr as *const _ as *const f32, one_len as usize) };
+    let two_slice = unsafe {
+        std::slice::from_raw_parts(two_ptr as *const _ as *const f32, (two_len / 4) as usize)
+    };
+    let similarity = unaligned::dot_prod(one_slice, two_slice);
+    std::mem::forget(one_slice);
+    std::mem::forget(two_slice);
+    return similarity;
 }
